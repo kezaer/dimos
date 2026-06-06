@@ -23,6 +23,7 @@ from dimos.core.global_config import global_config
 from dimos.core.transport import pSHMTransport
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.robot.unitree.go2.connection import GO2Connection
+from dimos.robot.unitree.go2.startup import go2_startup_preflight
 from dimos.visualization.vis_module import vis_module
 
 # Mac has some issue with high bandwidth UDP, so we use pSHMTransport for color_image
@@ -132,7 +133,9 @@ unitree_go2_basic = (
     autoconnect(
         _with_vis,
         GO2Connection.blueprint(),
-    ).global_config(n_workers=4, robot_model="unitree_go2")
+    )
+    .global_config(n_workers=4, robot_model="unitree_go2")
+    .preflights(go2_startup_preflight)
     # we temporarily disabled sensor timestamps
     # and are derriving all timestmaps upon reception
     # this is because image webrtc stream doesn't have timestamps,

@@ -30,6 +30,7 @@ from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.sensor_msgs.JointState import JointState
 from dimos.robot.unitree.go2.connection import GO2Connection
+from dimos.robot.unitree.go2.startup import go2_startup_preflight
 
 _go2_joints = make_twist_base_joints("go2")
 
@@ -71,6 +72,7 @@ unitree_go2_coordinator = (
         }
     )
     .global_config(obstacle_avoidance=False)
+    .preflights(go2_startup_preflight)
 )
 
 __all__ = ["unitree_go2_coordinator"]

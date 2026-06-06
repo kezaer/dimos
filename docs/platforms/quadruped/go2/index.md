@@ -69,9 +69,12 @@ Prints `SOURCE NAME IP MAC SERIAL` for every robot it sees over BLE and LAN. Exp
 export ROBOT_IP=<discovered_ip>
 ```
 
+If no `--robot-ip` is configured, exactly one Go2 is visible on the LAN, and its startup reachability probe succeeds, real WebRTC Go2 blueprints can resolve `--robot-ip` automatically at startup. If several Go2s are discovered, the configured `--robot-ip` does not respond, or the discovered robot does not respond to the probe, DimOS stops and asks you to pass `--robot-ip` explicitly or run the doctor. Go2 fleet runs always require explicit `--robot-ips` so startup never actuates every robot found on a shared lab network. Replay, simulation, and mock runs skip hardware discovery because they are intentional non-hardware modes and must keep working offline.
+
 ### Pre-flight checks
 
 1. Robot is reachable and low latency `<10ms`, 0% packet loss
+
 ```bash
 ping $ROBOT_IP
 ```
@@ -145,7 +148,6 @@ The agent subscribes to camera, LiDAR, and spatial memory streams — it sees wh
 | `unitree-go2-spatial` | Navigation + spatial memory |
 | `unitree-go2-detection` | Navigation + object detection |
 | `unitree-go2-ros` | ROS 2 bridge mode |
-
 ## Deep Dive
 
 - [Navigation Stack](/docs/capabilities/navigation/native/index.md) — column-carving voxel mapping, costmap generation, A* planning

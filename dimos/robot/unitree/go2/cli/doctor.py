@@ -27,15 +27,15 @@ import threading
 from typing import Any
 
 import psutil
-import requests
 
 from dimos.core.run_registry import RunEntry, get_most_recent
-from dimos.robot.unitree.go2.cli.landiscovery import Go2Device, discover
+from dimos.robot.unitree.go2.connectivity import GO2_SIGNAL_PORT, probe_go2_signal
+from dimos.robot.unitree.go2.lan_discovery import Go2Device, discover
 from dimos.visualization.rerun.constants import RERUN_GRPC_PORT, RERUN_WEB_VIEWER_PORT
 
 COMMAND_CENTER_PORT = 7779
 PHONE_TELEOP_PORT = 8444
-GO2_SIGNAL_PORT = 9991
+QUEST_TELEOP_PORT = 8443
 DEFAULT_IMAGE_TOPICS = ("jpeg_lcm:/color_image", "pshm:color_image")
 
 
@@ -111,6 +111,7 @@ class Go2DoctorReport:
     ports: list[PortCheck]
     image: ImageCheck
     suggested_urls: list[str]
+    next_steps: list[str]
 
     def has_problems(self) -> bool:
         levels = [self.robot.level, self.run.level, self.image.level]
@@ -123,14 +124,40 @@ class Go2DoctorReport:
         return asdict(self)
 
 
-def default_ui_endpoints(rerun_websocket_port: int) -> list[UiEndpoint]:
-    return [
+def default_ui_endpoints(
+    rerun_websocket_port: int,
+    *,
+    blueprint: str | None = None,
+) -> list[UiEndpoint]:
+    all_endpoints = [
         UiEndpoint("Command center", COMMAND_CENTER_PORT, "http"),
+        UiEndpoint("Quest teleop", QUEST_TELEOP_PORT, "https"),
         UiEndpoint("Phone teleop", PHONE_TELEOP_PORT, "https"),
         UiEndpoint("Rerun web viewer", RERUN_WEB_VIEWER_PORT, "http"),
         UiEndpoint("Rerun gRPC proxy", RERUN_GRPC_PORT, "rerun+http"),
         UiEndpoint("Rerun keyboard WebSocket", rerun_websocket_port, "ws"),
     ]
+    if blueprint is None:
+        return all_endpoints
+
+    selected: list[UiEndpoint] = []
+    if _blueprint_has_command_center(blueprint):
+        selected.append(UiEndpoint("Command center", COMMAND_CENTER_PORT, "http"))
+    if _blueprint_has_quest_teleop(blueprint):
+        selected.append(UiEndpoint("Quest teleop", QUEST_TELEOP_PORT, "https"))
+    if _blueprint_has_phone_teleop(blueprint):
+        selected.append(UiEndpoint("Phone teleop", PHONE_TELEOP_PORT, "https"))
+    if _blueprint_has_rerun(blueprint):
+        selected.extend(
+            [
+                UiEndpoint("Rerun web viewer", RERUN_WEB_VIEWER_PORT, "http"),
+                UiEndpoint("Rerun gRPC proxy", RERUN_GRPC_PORT, "rerun+http"),
+                UiEndpoint("Rerun keyboard WebSocket", rerun_websocket_port, "ws"),
+            ]
+        )
+    if _blueprint_has_scoped_ui_policy(blueprint):
+        return selected
+    return selected or all_endpoints
 
 
 def local_interfaces(robot_ip: str | None = None) -> list[LocalInterface]:
@@ -138,6 +165,8 @@ def local_interfaces(robot_ip: str | None = None) -> list[LocalInterface]:
     for name, addrs in psutil.net_if_addrs().items():
         for addr in addrs:
             if addr.family != socket.AF_INET or addr.address.startswith("127."):
+                continue
+            if not _host_is_lan_reachable(addr.address):
                 continue
             interfaces.append(
                 LocalInterface(
@@ -213,9 +242,7 @@ def check_robot(
 
     discovered_ips = {d.ip for d in devices}
     if robot_ip in discovered_ips:
-        message = (
-            f"LAN discovery found {robot_ip}, but {signal_port}/con_notify did not respond."
-        )
+        message = f"LAN discovery found {robot_ip}, but {signal_port}/con_notify did not respond."
         level = CheckLevel.WARN
     elif discovered_ips:
         message = (
@@ -225,8 +252,7 @@ def check_robot(
         level = CheckLevel.FAIL
     else:
         message = (
-            f"{robot_ip}:{signal_port}/con_notify is not reachable "
-            "and LAN discovery found no Go2."
+            f"{robot_ip}:{signal_port}/con_notify is not reachable and LAN discovery found no Go2."
         )
         level = CheckLevel.FAIL
 
@@ -369,7 +395,8 @@ def collect_report(
     discovery_timeout: float,
     connect_timeout: float,
     signal_port: int,
-    endpoints: list[UiEndpoint],
+    endpoints: list[UiEndpoint] | None,
+    rerun_websocket_port: int = 3030,
     check_image_enabled: bool,
     image_topics: list[str] | None = None,
     image_timeout: float = 2.0,
@@ -384,20 +411,26 @@ def collect_report(
     resolved_robot_ip = robot.robot_ip or robot_ip
     interfaces = local_interfaces(resolved_robot_ip)
     run = check_run()
+    endpoints = endpoints or default_ui_endpoints(
+        rerun_websocket_port,
+        blueprint=run.blueprint,
+    )
     probe_hosts = ["127.0.0.1", *(iface.ip for iface in interfaces)]
     ports = check_ports(endpoints, probe_hosts=probe_hosts)
     topics = list(image_topics or DEFAULT_IMAGE_TOPICS)
     image = check_image(enabled=check_image_enabled, topics=topics, timeout=image_timeout)
     robot = _adjust_robot_check_with_runtime_evidence(robot, image)
-    urls = suggested_urls(interfaces, ports)
-    return Go2DoctorReport(
+    urls = suggested_urls(interfaces, ports, robot_ip=resolved_robot_ip)
+    report = Go2DoctorReport(
         robot=robot,
         interfaces=interfaces,
         run=run,
         ports=ports,
         image=image,
         suggested_urls=urls,
+        next_steps=[],
     )
+    return replace(report, next_steps=suggested_next_steps(report))
 
 
 def format_report(report: Go2DoctorReport) -> str:
@@ -409,15 +442,16 @@ def format_report(report: Go2DoctorReport) -> str:
         for device in report.robot.discovered:
             serial = device.get("serial") or "?"
             ip = device.get("ip") or "?"
-            iface = device.get("iface") or "?"
+            iface_name = device.get("iface") or "?"
             mac = device.get("mac") or "-"
-            lines.append(f"        discovered serial={serial} ip={ip} iface={iface} mac={mac}")
+            lines.append(f"        discovered serial={serial} ip={ip} iface={iface_name} mac={mac}")
 
     lines.extend(["", "Local network"])
     if report.interfaces:
+        any_robot_subnet_match = any(iface.matches_robot_subnet for iface in report.interfaces)
         for iface in report.interfaces:
-            suffix = "same subnet as robot" if iface.matches_robot_subnet else "not matched"
-            lines.append(f"  [OK] {iface.name}: {iface.ip} ({suffix})")
+            level, suffix = _interface_status(iface, report.robot.robot_ip, any_robot_subnet_match)
+            lines.append(f"  [{level}] {iface.name}: {iface.ip} ({suffix})")
     else:
         lines.append("  [WARN] No non-loopback IPv4 interfaces found.")
 
@@ -439,25 +473,160 @@ def format_report(report: Go2DoctorReport) -> str:
         lines.extend(["", "Suggested URLs"])
         lines.extend(f"  {url}" for url in report.suggested_urls)
 
+    if report.next_steps:
+        lines.extend(["", "Next steps"])
+        lines.extend(f"  {index}. {step}" for index, step in enumerate(report.next_steps, 1))
+
     return "\n".join(lines)
 
 
-def suggested_urls(interfaces: list[LocalInterface], ports: list[PortCheck]) -> list[str]:
+def suggested_urls(
+    interfaces: list[LocalInterface],
+    ports: list[PortCheck],
+    *,
+    robot_ip: str | None = None,
+) -> list[str]:
     command = next((p for p in ports if p.port == COMMAND_CENTER_PORT and p.listening), None)
+    quest = next((p for p in ports if p.port == QUEST_TELEOP_PORT and p.listening), None)
     phone = next((p for p in ports if p.port == PHONE_TELEOP_PORT and p.listening), None)
-    if command is None and phone is None:
+    if command is None and quest is None and phone is None:
         return []
 
-    preferred = [i for i in interfaces if i.matches_robot_subnet] or interfaces
+    matched_interfaces = [i for i in interfaces if i.matches_robot_subnet]
+    if robot_ip is not None and not matched_interfaces:
+        return []
+    preferred = matched_interfaces or interfaces
     command_accessible = command is not None and _port_lan_accessible(command)
+    quest_accessible = quest is not None and _port_lan_accessible(quest)
     phone_accessible = phone is not None and _port_lan_accessible(phone)
     urls: list[str] = []
     for iface in preferred:
         if command_accessible:
             urls.append(f"http://{iface.ip}:{COMMAND_CENTER_PORT}/command-center")
+        if quest_accessible:
+            urls.append(f"https://{iface.ip}:{QUEST_TELEOP_PORT}/teleop")
         if phone_accessible:
             urls.append(f"https://{iface.ip}:{PHONE_TELEOP_PORT}/teleop")
     return urls
+
+
+def suggested_next_steps(report: Go2DoctorReport) -> list[str]:
+    steps: list[str] = []
+
+    if report.robot.robot_ip is None:
+        steps.append("Run `dimos go2tool discover --lan --timeout 10` to find Go2 LAN IPs.")
+    elif not report.robot.signal_reachable:
+        if report.run.level is CheckLevel.OK:
+            steps.append(
+                "Run "
+                f"`dimos go2tool doctor --robot-ip {report.robot.robot_ip} --check-image` "
+                "to verify whether the WebRTC data plane is active."
+            )
+        else:
+            steps.append(
+                f"Confirm the Go2 IP and local network, then rerun "
+                f"`dimos go2tool doctor --robot-ip {report.robot.robot_ip}`."
+            )
+
+    discovered_ip = _first_discovered_ip(report)
+    if report.robot.robot_ip is None and discovered_ip is not None:
+        steps.append(f"Rerun with `dimos go2tool doctor --robot-ip {discovered_ip}`.")
+
+    if _robot_subnet_missing(report):
+        steps.append("Connect this computer to the Go2 Wi-Fi/LAN, then rerun the doctor.")
+
+    if any(port.listening and port.lan_reachable is False for port in report.ports):
+        command = _run_command_for_blueprint(
+            report.run.blueprint,
+            listen_host="0.0.0.0",
+        )
+        steps.append(
+            f"Restart with `{command}` so phone and browser UIs are reachable from LAN devices."
+        )
+
+    if (
+        report.image.level is CheckLevel.SKIP
+        and report.robot.robot_ip is not None
+        and report.run.level is CheckLevel.OK
+    ):
+        steps.append(
+            f"Run `dimos go2tool doctor --robot-ip {report.robot.robot_ip} --check-image` "
+            "to verify the color_image stream."
+        )
+
+    return steps
+
+
+def _interface_status(
+    iface: LocalInterface,
+    robot_ip: str | None,
+    any_robot_subnet_match: bool,
+) -> tuple[str, str]:
+    if robot_ip is None:
+        return "OK", "available"
+    if iface.matches_robot_subnet:
+        return "OK", "same subnet as robot"
+    if any_robot_subnet_match:
+        return "SKIP", "not in robot subnet"
+    return "WARN", "not in robot subnet"
+
+
+def _first_discovered_ip(report: Go2DoctorReport) -> str | None:
+    for device in report.robot.discovered:
+        ip = device.get("ip")
+        if ip:
+            return ip
+    return None
+
+
+def _robot_subnet_missing(report: Go2DoctorReport) -> bool:
+    return report.robot.robot_ip is not None and not any(
+        iface.matches_robot_subnet for iface in report.interfaces
+    )
+
+
+def _run_command_for_blueprint(
+    blueprint: str | None,
+    *,
+    listen_host: str | None = None,
+) -> str:
+    prefix = f"dimos --listen-host {listen_host}" if listen_host else "dimos"
+    return f"{prefix} run {blueprint or '<blueprint>'}"
+
+
+def _blueprint_has_command_center(blueprint: str) -> bool:
+    no_command_center = {
+        "go2-connection",
+        "go2-fleet-connection",
+        "unitree-go2-coordinator",
+        "unitree-go2-keyboard-teleop",
+        "unitree-go2-webrtc-keyboard-teleop",
+        "unitree-go2-webrtc-rage-keyboard-teleop",
+    }
+    return (blueprint.startswith("unitree-go2") and blueprint not in no_command_center) or (
+        blueprint.startswith("teleop-phone-go2")
+    )
+
+
+def _blueprint_has_rerun(blueprint: str) -> bool:
+    return _blueprint_has_command_center(blueprint)
+
+
+def _blueprint_has_quest_teleop(blueprint: str) -> bool:
+    return blueprint.startswith("teleop-quest")
+
+
+def _blueprint_has_phone_teleop(blueprint: str) -> bool:
+    return blueprint.startswith("teleop-phone")
+
+
+def _blueprint_has_scoped_ui_policy(blueprint: str) -> bool:
+    return (
+        blueprint.startswith("unitree-go2")
+        or blueprint.startswith("teleop-phone")
+        or blueprint.startswith("teleop-quest")
+        or blueprint in {"go2-connection", "go2-fleet-connection"}
+    )
 
 
 def _same_subnet(local_ip: str, netmask: str | None, robot_ip: str | None) -> bool:
@@ -497,11 +666,7 @@ def _tcp_reachable(host: str, port: int, timeout: float) -> bool:
 
 
 def _signal_endpoint_reachable(host: str, port: int, timeout: float) -> bool:
-    try:
-        response = requests.get(f"http://{host}:{port}/con_notify", timeout=timeout)
-    except requests.RequestException:
-        return False
-    return response.ok
+    return probe_go2_signal(host, timeout, port=port)
 
 
 def _device_dict(device: Go2Device) -> dict[str, str | None]:
@@ -613,9 +778,15 @@ def _check_port(
 
 
 def _host_is_lan_reachable(host: str) -> bool:
-    return host in {"0.0.0.0", "::"} or not (
-        host.startswith("127.") or host in {"::1", "localhost"}
-    )
+    if host == "localhost":
+        return False
+    try:
+        address = ipaddress.ip_address(host.strip("[]").split("%", 1)[0])
+    except ValueError:
+        return not host.startswith("127.")
+    if address.is_unspecified:
+        return True
+    return not (address.is_loopback or address.is_link_local)
 
 
 def _port_lan_accessible(port: PortCheck) -> bool:
