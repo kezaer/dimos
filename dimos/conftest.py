@@ -17,6 +17,7 @@ from contextlib import suppress
 import hashlib
 import os
 import platform
+import subprocess
 import tempfile
 import threading
 import uuid
@@ -67,7 +68,7 @@ from dotenv import load_dotenv
 import pytest
 
 from dimos.core.coordination.module_coordinator import ModuleCoordinator
-from dimos.core.coordination.process_lifecycle import spawn_watchdog
+from dimos.core.coordination.process_lifecycle import kill_run_processes, spawn_watchdog
 
 load_dotenv()
 
@@ -110,10 +111,30 @@ def pytest_configure(config):
 
     # Only spawn on the controller, without doing it on xdist workers.
     if not hasattr(config, "workerinput"):
-        spawn_watchdog(
+        config._dimos_watchdog_proc = spawn_watchdog(
             os.environ[DIMOS_PYTEST_RUN_ID_ENV],
             env_var=DIMOS_PYTEST_RUN_ID_ENV,
         )
+
+
+def pytest_unconfigure(config):
+    proc = getattr(config, "_dimos_watchdog_proc", None)
+    if proc is None:
+        return
+
+    run_id = os.environ.get(DIMOS_PYTEST_RUN_ID_ENV)
+    if run_id is not None:
+        kill_run_processes(run_id, exclude_pids=[proc.pid], env_var=DIMOS_PYTEST_RUN_ID_ENV)
+
+    if proc.poll() is not None:
+        return
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=1.0)
 
 
 @pytest.fixture(scope="session")

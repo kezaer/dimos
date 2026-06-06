@@ -33,7 +33,9 @@ from dimos.core.coordination.blueprints import (
     StreamRef,
     autoconnect,
 )
+from dimos.core.coordination.preflight import PreflightResult, owned_preflight, run_preflights
 from dimos.core.core import rpc
+from dimos.core.global_config import GlobalConfig
 from dimos.core.module import Module
 from dimos.core.stream import In, Out
 from dimos.core.transport import LCMTransport
@@ -156,6 +158,49 @@ def test_global_config() -> None:
     assert blueprint_set.global_config_overrides["option1"] is True
     assert "option2" in blueprint_set.global_config_overrides
     assert blueprint_set.global_config_overrides["option2"] == 42
+
+
+def test_preflights_merge_through_autoconnect() -> None:
+    def preflight_a(config: GlobalConfig) -> PreflightResult:
+        return PreflightResult.ok(notes=(f"a sees viewer={config.viewer}",))
+
+    def preflight_b(config: GlobalConfig) -> PreflightResult:
+        return PreflightResult.ok(config_updates={"robot_ip": config.robot_ip or "1.2.3.4"})
+
+    bp_a = ModuleA.blueprint().preflights(preflight_a)
+    bp_b = ModuleB.blueprint().preflights(preflight_b)
+
+    blueprint_set = autoconnect(bp_a, bp_b)
+
+    assert blueprint_set.preflight_checks == (preflight_a, preflight_b)
+
+
+def test_preflights_are_not_duplicated_by_nested_autoconnect() -> None:
+    def preflight(config: GlobalConfig) -> PreflightResult:
+        return PreflightResult.ok()
+
+    base = ModuleA.blueprint().preflights(preflight)
+
+    blueprint_set = autoconnect(base, autoconnect(base, ModuleB.blueprint()))
+
+    assert blueprint_set.preflight_checks == (preflight,)
+
+
+def test_owned_preflight_metadata_is_composable_for_reused_functions() -> None:
+    calls: list[str] = []
+
+    def preflight(config: GlobalConfig) -> PreflightResult:
+        calls.append("called")
+        return PreflightResult.ok()
+
+    blueprint_set = autoconnect(
+        ModuleA.blueprint().preflights(owned_preflight(preflight, ModuleA)),
+        ModuleB.blueprint().preflights(owned_preflight(preflight, ModuleB)),
+    ).disabled_modules(ModuleB)
+
+    run_preflights(blueprint_set, GlobalConfig())
+
+    assert calls == ["called"]
 
 
 def test_future_annotations_support() -> None:
