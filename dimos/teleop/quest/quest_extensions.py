@@ -34,6 +34,7 @@ from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.TwistStamped import TwistStamped
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.sensor_msgs.Image import Image
+from dimos.msgs.sensor_msgs.Joy import Joy
 from dimos.teleop.quest.quest_teleop_module import Hand, QuestTeleopConfig, QuestTeleopModule
 from dimos.teleop.quest.quest_types import Buttons, QuestControllerState
 from dimos.utils.logging_config import setup_logger
@@ -257,8 +258,9 @@ class Go2TeleopModule(QuestTeleopModule):
     def _deadzone(self, v: float) -> float:
         return 0.0 if abs(v) < self.config.deadzone else v
 
-    def _on_joy_bytes(self, data: bytes) -> None:
-        super()._on_joy_bytes(data)
+    def _on_joy_msg(self, msg: Joy) -> bool:
+        if not super()._on_joy_msg(msg):
+            return False
         with self._lock:
             left = self._controllers.get(Hand.LEFT)
             right = self._controllers.get(Hand.RIGHT)
@@ -271,6 +273,7 @@ class Go2TeleopModule(QuestTeleopModule):
         if right is not None:
             twist.angular.z = -self._deadzone(right.thumbstick.x) * self.config.angular_speed
         self.cmd_vel.publish(twist)
+        return True
 
     async def handle_color_image(self, msg: Image) -> None:
         _push_jpeg(self, msg, self.config.video_jpeg_quality)

@@ -32,12 +32,14 @@ from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.robot.unitree.go2.connection import GO2Connection
+from dimos.robot.unitree.go2.startup import go2_startup_preflight
 from dimos.teleop.quest.quest_extensions import (
     ArmTeleopModule,
     Go2TeleopModule,
     VideoArmTeleopModule,
 )
 from dimos.teleop.quest.quest_types import Buttons
+from dimos.teleop.quest.startup import quest_teleop_lan_ui_preflight
 from dimos.visualization.vis_module import vis_module
 
 # Arm teleop with press-and-hold engage (has rerun viz)
@@ -142,6 +144,7 @@ teleop_quest_go2 = (
         }
     )
     .global_config(robot_model="unitree_go2")
+    .preflights(go2_startup_preflight, quest_teleop_lan_ui_preflight)
 )
 
 

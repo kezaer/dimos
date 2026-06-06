@@ -129,7 +129,8 @@
           {
             "group": "Quadruped",
             "pages": [
-              "platforms/quadruped/go2/index"
+              "platforms/quadruped/go2/index",
+              "platforms/quadruped/go2/local_wifi_teleop_troubleshooting"
             ]
           },
           {

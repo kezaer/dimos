@@ -165,8 +165,6 @@
     <button id="teleop-btn">HOLD TO TELEOP</button>
 
     <script type="module">
-        import { geometry_msgs, std_msgs } from "https://esm.sh/jsr/@dimos/msgs@0.1.4";
-
         // ============================================
         // State
         // ============================================
@@ -316,37 +314,28 @@
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
             const nowMs = Date.now();
-            const header = new std_msgs.Header({
-                stamp: new std_msgs.Time({
-                    sec: Math.floor(nowMs / 1000),
-                    nsec: (nowMs % 1000) * 1_000_000
-                }),
-                frame_id: "phone"
-            });
 
             // --- Send raw sensors as TwistStamped ---
             // linear = orientation (roll, pitch, yaw) in degrees
             // angular = gyro rates (pitch, roll, yaw) in deg/s
-            const twistStamped = new geometry_msgs.TwistStamped({
-                header: header,
-                twist: new geometry_msgs.Twist({
-                    linear: new geometry_msgs.Vector3({
-                        x: orientation.roll,
-                        y: orientation.pitch,
-                        z: orientation.yaw
-                    }),
-                    angular: new geometry_msgs.Vector3({
-                        x: gyro.x,
-                        y: gyro.y,
-                        z: gyro.z
-                    })
-                })
-            });
-            ws.send(twistStamped.encode());
+            ws.send(JSON.stringify({
+                type: "phone_sensors",
+                ts: nowMs / 1000,
+                frame_id: "phone",
+                linear: {
+                    x: orientation.roll,
+                    y: orientation.pitch,
+                    z: orientation.yaw
+                },
+                angular: {
+                    x: gyro.x,
+                    y: gyro.y,
+                    z: gyro.z
+                }
+            }));
 
             // --- Send teleop button as Bool ---
-            const boolMsg = new std_msgs.Bool({ data: teleopActive ? 1 : 0 });
-            ws.send(boolMsg.encode());
+            ws.send(JSON.stringify({ type: "phone_button", data: teleopActive }));
 
             updateDisplay();
         }

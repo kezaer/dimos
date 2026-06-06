@@ -16,12 +16,14 @@
 """
 Phone Teleoperation Module.
 
-Receives raw sensor data (TwistStamped) and button state (Bool) from the
-phone web app via an embedded FastAPI WebSocket server.  Computes orientation
-deltas from an initial orientation captured on engage, converts to TwistStamped
-velocity commands via configurable gains, and publishes.
+Receives raw sensor data and button state from the phone web app as JSON over
+an embedded FastAPI WebSocket server.  Legacy binary LCM messages are still
+accepted for compatibility.  Computes orientation deltas from an initial
+orientation captured on engage, converts to TwistStamped velocity commands via
+configurable gains, and publishes.
 """
 
+import json
 from pathlib import Path
 import threading
 import time
@@ -33,6 +35,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from dimos.constants import STATE_DIR
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import Out
@@ -41,12 +44,21 @@ from dimos.msgs.geometry_msgs.TwistStamped import TwistStamped
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.std_msgs.Bool import Bool
 from dimos.utils.logging_config import setup_logger
-from dimos.utils.path_utils import get_project_root
 from dimos.web.robot_web_interface import RobotWebInterface
 
 logger = setup_logger()
 
 STATIC_DIR = Path(__file__).parent / "web" / "static"
+
+
+def _json_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 class PhoneTeleopConfig(ModuleConfig):
@@ -59,8 +71,8 @@ class PhoneTeleopConfig(ModuleConfig):
 class PhoneTeleopModule(Module):
     """
     Receives raw sensor data from the phone web app via an embedded WebSocket server:
-      - TwistStamped: linear=(roll, pitch, yaw) deg, angular=(gyro) deg/s
-      - Bool: teleop button state (True = held)
+      - JSON phone_sensors: linear=(roll, pitch, yaw) deg, angular=(gyro) deg/s
+      - JSON phone_button: teleop button state (True = held)
 
     Outputs:
         - twist_output: TwistStamped (velocity command for robot)
@@ -85,7 +97,7 @@ class PhoneTeleopModule(Module):
         self._stop_event = threading.Event()
 
         # Embedded web server — RobotWebInterface provides FastAPI app + run()/shutdown()
-        self._web_server = RobotWebInterface(port=self.config.server_port)
+        self._web_server = self._create_web_server()
         self._web_server_thread: threading.Thread | None = None
 
         # Fingerprint-based message dispatch table
@@ -95,6 +107,12 @@ class PhoneTeleopModule(Module):
         }
 
         self._setup_routes()
+
+    def _create_web_server(self) -> RobotWebInterface:
+        return RobotWebInterface(
+            host=self.config.g.listen_host,
+            port=self.config.server_port,
+        )
 
     def _setup_routes(self) -> None:
         """Register teleop routes on the embedded web server."""
@@ -115,13 +133,21 @@ class PhoneTeleopModule(Module):
             logger.info("Phone client connected")
             try:
                 while True:
-                    data = await ws.receive_bytes()
-                    fingerprint = data[:8]
-                    decoder = self._decoders.get(fingerprint)
-                    if decoder:
-                        decoder(data)
-                    else:
-                        logger.warning(f"Unknown message fingerprint: {fingerprint.hex()}")
+                    message = await ws.receive()
+                    if message["type"] == "websocket.disconnect":
+                        raise WebSocketDisconnect()
+                    data = message.get("bytes")
+                    if data is not None:
+                        fingerprint = data[:8]
+                        decoder = self._decoders.get(fingerprint)
+                        if decoder:
+                            decoder(data)
+                        else:
+                            logger.warning(f"Unknown message fingerprint: {fingerprint.hex()}")
+                        continue
+                    text = message.get("text")
+                    if text is not None:
+                        self._on_json_message(text)
             except WebSocketDisconnect:
                 logger.info("Phone client disconnected")
             except Exception:
@@ -158,14 +184,48 @@ class PhoneTeleopModule(Module):
     def _on_sensors_bytes(self, data: bytes) -> None:
         """Decode raw LCM bytes into TwistStamped and update sensor state."""
         msg = TwistStamped.lcm_decode(data)
+        self._on_sensors_msg(msg)
+
+    def _on_sensors_msg(self, msg: TwistStamped) -> None:
         with self._lock:
             self._current_sensors = msg
 
     def _on_button_bytes(self, data: bytes) -> None:
         """Decode raw LCM bytes into Bool and update button state."""
         msg = Bool.lcm_decode(data)
+        self._on_button_msg(msg)
+
+    def _on_button_msg(self, msg: Bool) -> None:
         with self._lock:
             self._teleop_button = bool(msg.data)
+
+    def _on_json_message(self, data: str) -> None:
+        try:
+            payload = json.loads(data)
+            msg_type = payload.get("type")
+            if msg_type == "phone_sensors":
+                linear = payload["linear"]
+                angular = payload["angular"]
+                self._on_sensors_msg(
+                    TwistStamped(
+                        ts=float(payload.get("ts", 0.0)),
+                        frame_id=str(payload.get("frame_id", "phone")),
+                        linear=[float(linear["x"]), float(linear["y"]), float(linear["z"])],
+                        angular=[
+                            float(angular["x"]),
+                            float(angular["y"]),
+                            float(angular["z"]),
+                        ],
+                    )
+                )
+                return
+            if msg_type == "phone_button":
+                self._on_button_msg(Bool(data=_json_bool(payload.get("data", False))))
+                return
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            logger.warning(f"Ignoring malformed phone teleop JSON message: {exc}")
+            return
+        logger.warning(f"Unknown phone teleop JSON message type: {msg_type!r}")
 
     def _start_server(self) -> None:
         """Start the embedded FastAPI server with HTTPS in a daemon thread."""
@@ -175,12 +235,15 @@ class PhoneTeleopModule(Module):
 
         self._web_server_thread = threading.Thread(
             target=self._web_server.run,
-            kwargs={"ssl": True, "ssl_certs_dir": get_project_root() / "assets" / "teleop_certs"},
+            kwargs={"ssl": True, "ssl_certs_dir": STATE_DIR / "teleop_certs"},
             daemon=True,
             name="PhoneTeleopWebServer",
         )
         self._web_server_thread.start()
-        logger.info(f"Phone teleop web server started on https://0.0.0.0:{self.config.server_port}")
+        logger.info(
+            f"Phone teleop web server started on "
+            f"https://{self.config.g.listen_host}:{self.config.server_port}"
+        )
 
     def _stop_server(self) -> None:
         """Shutdown the embedded web server."""

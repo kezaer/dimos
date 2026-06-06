@@ -81,6 +81,8 @@ ping $ROBOT_IP
 
 2. Built-in obstacle avoidance is on. (DimOS handles path planning, but the onboard obstacle avoidance provides an extra safety layer around tight spots)
 
+For local Wi-Fi setup, browser teleop, video feed, dashboard, and reconnect issues, see [Go2 Local Wi-Fi Teleop Troubleshooting](/docs/platforms/quadruped/go2/local_wifi_teleop_troubleshooting.md).
+
 ### Ready to run DimOS
 
 ```bash
@@ -148,8 +150,11 @@ The agent subscribes to camera, LiDAR, and spatial memory streams — it sees wh
 | `unitree-go2-spatial` | Navigation + spatial memory |
 | `unitree-go2-detection` | Navigation + object detection |
 | `unitree-go2-ros` | ROS 2 bridge mode |
+| `teleop-phone-go2` | Phone teleop + Go2 connection + web dashboard |
+
 ## Deep Dive
 
+- [Local Wi-Fi Teleop Troubleshooting](/docs/platforms/quadruped/go2/local_wifi_teleop_troubleshooting.md) — discovery, reconnects, dashboard, video, keyboard, phone teleop, and macOS checks
 - [Navigation Stack](/docs/capabilities/navigation/native/index.md) — column-carving voxel mapping, costmap generation, A* planning
 - [Visualization](/docs/usage/visualization.md) — Rerun, performance tuning
 - [Data Streams](/docs/usage/data_streams) — RxPY streams, backpressure, quality filtering

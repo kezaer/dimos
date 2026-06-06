@@ -16,14 +16,16 @@
 """
 Quest Teleoperation Module.
 
-Receives VR controller tracking data from the Quest web app via an embedded
-FastAPI WebSocket server.  Transforms from WebXR to robot frame, computes
+Receives VR controller tracking data from the Quest web app as JSON over an
+embedded FastAPI WebSocket server.  Legacy binary LCM messages are still
+accepted for compatibility.  Transforms from WebXR to robot frame, computes
 deltas, and publishes PoseStamped commands.
 """
 
 import asyncio
 from dataclasses import dataclass
 from enum import IntEnum
+import json
 from pathlib import Path
 import threading
 import time
@@ -35,6 +37,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from dimos.constants import STATE_DIR
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import Out
@@ -43,7 +46,6 @@ from dimos.msgs.sensor_msgs.Joy import Joy
 from dimos.teleop.quest.quest_types import Buttons, QuestControllerState
 from dimos.teleop.utils.teleop_transforms import webxr_to_robot
 from dimos.utils.logging_config import setup_logger
-from dimos.utils.path_utils import get_project_root
 from dimos.web.robot_web_interface import RobotWebInterface
 
 logger = setup_logger()
@@ -83,8 +85,9 @@ class QuestTeleopModule(Module):
     """Quest Teleoperation Module for Meta Quest controllers.
 
     Receives controller data from the Quest web app via an embedded WebSocket
-    server, computes output poses, and publishes them.  Subclass to customize
-    pose computation, output format, and engage behavior.
+    server, computes output poses, and publishes them. Browser clients send JSON;
+    legacy binary LCM messages remain supported. Subclass to customize pose
+    computation, output format, and engage behavior.
 
     Outputs:
         - left_controller_output: PoseStamped (output pose for left hand)
@@ -117,7 +120,7 @@ class QuestTeleopModule(Module):
         self._stop_event = threading.Event()
 
         # Embedded web server — RobotWebInterface provides FastAPI app + run()/shutdown()
-        self._web_server = RobotWebInterface(port=self.config.server_port)
+        self._web_server = self._create_web_server()
         self._web_server_thread: threading.Thread | None = None
 
         # Fingerprint-based message dispatch table
@@ -134,6 +137,12 @@ class QuestTeleopModule(Module):
         self._ws_loop: asyncio.AbstractEventLoop | None = None
 
         self._setup_routes()
+
+    def _create_web_server(self) -> RobotWebInterface:
+        return RobotWebInterface(
+            host=self.config.g.listen_host,
+            port=self.config.server_port,
+        )
 
     def _setup_routes(self) -> None:
         """Register teleop routes on the embedded web server."""
@@ -157,13 +166,21 @@ class QuestTeleopModule(Module):
             logger.info("Quest client connected")
             try:
                 while True:
-                    data = await ws.receive_bytes()
-                    fingerprint = data[:8]
-                    decoder = self._decoders.get(fingerprint)
-                    if decoder:
-                        decoder(data)
-                    else:
-                        logger.warning(f"Unknown message fingerprint: {fingerprint.hex()}")
+                    message = await ws.receive()
+                    if message["type"] == "websocket.disconnect":
+                        raise WebSocketDisconnect()
+                    data = message.get("bytes")
+                    if data is not None:
+                        fingerprint = data[:8]
+                        decoder = self._decoders.get(fingerprint)
+                        if decoder:
+                            decoder(data)
+                        else:
+                            logger.warning(f"Unknown message fingerprint: {fingerprint.hex()}")
+                        continue
+                    text = message.get("text")
+                    if text is not None:
+                        self._on_json_message(text)
             except WebSocketDisconnect:
                 logger.info("Quest client disconnected")
             except Exception:
@@ -228,6 +245,9 @@ class QuestTeleopModule(Module):
     def _on_pose_bytes(self, data: bytes) -> None:
         """Decode LCM bytes into PoseStamped, transform to robot frame."""
         msg = PoseStamped.lcm_decode(data)
+        self._on_pose_msg(msg)
+
+    def _on_pose_msg(self, msg: PoseStamped) -> None:
         hand = self._resolve_hand(msg.frame_id)
         robot_pose = webxr_to_robot(msg, is_left_controller=(hand == Hand.LEFT))
         with self._lock:
@@ -236,16 +256,60 @@ class QuestTeleopModule(Module):
     def _on_joy_bytes(self, data: bytes) -> None:
         """Decode LCM bytes into Joy, parse into QuestControllerState."""
         msg = Joy.lcm_decode(data)
-        hand = Hand.LEFT if msg.frame_id == "left" else Hand.RIGHT
+        self._on_joy_msg(msg)
+
+    def _on_joy_msg(self, msg: Joy) -> bool:
+        hand = self._resolve_hand(msg.frame_id)
         try:
             controller = QuestControllerState.from_joy(msg, is_left=(hand == Hand.LEFT))
         except ValueError:
             logger.warning(
                 f"Malformed Joy for {hand.name}: axes={len(msg.axes or [])}, buttons={len(msg.buttons or [])}"
             )
-            return
+            return False
         with self._lock:
             self._controllers[hand] = controller
+        return True
+
+    def _on_json_message(self, data: str) -> None:
+        try:
+            payload = json.loads(data)
+            msg_type = payload.get("type")
+            if msg_type == "pose":
+                position = payload["position"]
+                orientation = payload["orientation"]
+                self._on_pose_msg(
+                    PoseStamped(
+                        ts=float(payload.get("ts", 0.0)),
+                        frame_id=str(payload["frame_id"]),
+                        position=[
+                            float(position["x"]),
+                            float(position["y"]),
+                            float(position["z"]),
+                        ],
+                        orientation=[
+                            float(orientation["x"]),
+                            float(orientation["y"]),
+                            float(orientation["z"]),
+                            float(orientation["w"]),
+                        ],
+                    )
+                )
+                return
+            if msg_type == "joy":
+                self._on_joy_msg(
+                    Joy(
+                        ts=float(payload.get("ts", 0.0)),
+                        frame_id=str(payload["frame_id"]),
+                        axes=[float(value) for value in payload.get("axes", [])],
+                        buttons=[int(value) for value in payload.get("buttons", [])],
+                    )
+                )
+                return
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            logger.warning(f"Ignoring malformed Quest teleop JSON message: {exc}")
+            return
+        logger.warning(f"Unknown Quest teleop JSON message type: {msg_type!r}")
 
     def _start_server(self) -> None:
         """Start the embedded FastAPI server with HTTPS in a daemon thread."""
@@ -255,12 +319,15 @@ class QuestTeleopModule(Module):
 
         self._web_server_thread = threading.Thread(
             target=self._web_server.run,
-            kwargs={"ssl": True, "ssl_certs_dir": get_project_root() / "assets" / "teleop_certs"},
+            kwargs={"ssl": True, "ssl_certs_dir": STATE_DIR / "teleop_certs"},
             daemon=True,
             name="QuestTeleopWebServer",
         )
         self._web_server_thread.start()
-        logger.info(f"Quest teleop web server started on https://0.0.0.0:{self.config.server_port}")
+        logger.info(
+            f"Quest teleop web server started on "
+            f"https://{self.config.g.listen_host}:{self.config.server_port}"
+        )
 
     def _stop_server(self) -> None:
         """Shutdown the embedded web server."""
