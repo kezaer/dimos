@@ -53,7 +53,7 @@ def discover(
 
     async def run() -> None:
         from dimos.robot.unitree.go2.cli.ble import discover_ble
-        from dimos.robot.unitree.go2.cli.landiscovery import discover_lan
+        from dimos.robot.unitree.go2.lan_discovery import discover_lan
 
         seen_ble: set[tuple[str, str | None]] = set()
         seen_lan: set[str] = set()
@@ -206,7 +206,7 @@ def doctor(
     robot_ip: str | None = typer.Option(
         None,
         "--robot-ip",
-        help="Go2 IP address. Defaults to parent --robot-ip, DIMOS_ROBOT_IP, or LAN discovery.",
+        help="Go2 IP address. Defaults to parent --robot-ip, ROBOT_IP, or LAN discovery.",
     ),
     discover_lan: bool = typer.Option(
         True,
@@ -263,7 +263,6 @@ def doctor(
     from dimos.robot.unitree.go2.cli.doctor import (
         UiEndpoint,
         collect_report,
-        default_ui_endpoints,
         format_report,
     )
 
@@ -281,9 +280,7 @@ def doctor(
         else global_config.rerun_websocket_server_port
     )
     endpoints = (
-        [UiEndpoint(f"Custom UI {port}", port, "tcp") for port in ui_port]
-        if ui_port
-        else default_ui_endpoints(rerun_ws_port)
+        [UiEndpoint(f"Custom UI {port}", port, "tcp") for port in ui_port] if ui_port else None
     )
 
     report = collect_report(
@@ -293,6 +290,7 @@ def doctor(
         connect_timeout=connect_timeout,
         signal_port=signal_port,
         endpoints=endpoints,
+        rerun_websocket_port=rerun_ws_port,
         check_image_enabled=check_image,
         image_topics=image_topic or None,
         image_timeout=image_timeout,

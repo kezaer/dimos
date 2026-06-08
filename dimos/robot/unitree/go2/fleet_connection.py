@@ -43,15 +43,28 @@ logger = setup_logger()
 
 
 class FleetConnectionConfig(ConnectionConfig):
-    ips: Sequence[str] = Field(
-        default_factory=lambda m: [ip.strip() for ip in m["g"].robot_ips.split(",")]
-    )
+    ips: Sequence[str] = Field(default_factory=lambda m: _default_fleet_ips(m))
 
     @model_validator(mode="after")
     def set_ip_after_validation(self) -> Self:
-        if self.ip is None:
+        if self.ip is None and self.ips:
             self.ip = self.ips[0]
+        elif self.ip is None:
+            raise ValueError("robot_ips must be set for real Go2 fleet runs")
         return self
+
+
+def _default_fleet_ips(values: dict[str, Any]) -> list[str]:
+    cfg = values["g"]
+    if cfg.robot_ips:
+        return [ip.strip() for ip in cfg.robot_ips.split(",") if ip.strip()]
+    if cfg.robot_ip:
+        return [cfg.robot_ip]
+
+    connection_type = cfg.unitree_connection_type.lower()
+    if connection_type == "webrtc":
+        return []
+    return [connection_type]
 
 
 class Go2FleetConnection(GO2Connection):

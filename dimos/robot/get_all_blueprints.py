@@ -53,7 +53,19 @@ def get_module_by_name(name: str) -> Blueprint:
         _raise_unknown(name, list(all_modules.keys()))
     module_path, class_name = all_modules[name].rsplit(".", 1)
     python_module = __import__(module_path, fromlist=[class_name])
-    return getattr(python_module, class_name).blueprint()  # type: ignore[no-any-return]
+    blueprint = getattr(python_module, class_name).blueprint()
+    if module_path == "dimos.robot.unitree.go2.connection" and class_name == "GO2Connection":
+        from dimos.robot.unitree.go2.startup import go2_startup_preflight
+
+        return blueprint.preflights(go2_startup_preflight)  # type: ignore[no-any-return]
+    if (
+        module_path == "dimos.robot.unitree.go2.fleet_connection"
+        and class_name == "Go2FleetConnection"
+    ):
+        from dimos.robot.unitree.go2.startup import go2_fleet_startup_preflight
+
+        return blueprint.preflights(go2_fleet_startup_preflight)  # type: ignore[no-any-return]
+    return blueprint  # type: ignore[no-any-return]
 
 
 def get_by_name(name: str) -> Blueprint:
