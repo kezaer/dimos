@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Mapping, MutableMapping
+from contextlib import suppress
 import importlib
 import inspect
 import shutil
@@ -24,6 +25,7 @@ import threading
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from dimos.core.coordination.coordinator_rpc import CoordinatorRPC
+from dimos.core.coordination.preflight import run_preflights
 from dimos.core.coordination.worker_manager import WorkerManager
 from dimos.core.coordination.worker_manager_python import WorkerManagerPython
 from dimos.core.global_config import GlobalConfig, global_config
@@ -40,6 +42,18 @@ if TYPE_CHECKING:
     from dimos.core.rpc_client import ModuleProxy, ModuleProxyProtocol
 
 logger = setup_logger()
+
+
+class RequirementError(RuntimeError):
+    """Raised when blueprint requirement checks reject startup."""
+
+    def __init__(self, errors: list[str]) -> None:
+        self.errors = tuple(errors)
+        super().__init__("; ".join(self.errors))
+
+
+class ConfiguratorError(RuntimeError):
+    """Raised when system configurators reject startup."""
 
 
 class ModuleDescriptor(NamedTuple):
@@ -195,11 +209,7 @@ class ModuleCoordinator(Resource):
             for index, module in zip(indices_by_deployment[dep], deployed, strict=True):
                 results[index] = module
 
-        try:
-            safe_thread_map(list(specs_by_deployment.keys()), _deploy_group)
-        except:
-            self.stop()
-            raise
+        safe_thread_map(list(specs_by_deployment.keys()), _deploy_group)
 
         with self._modules_lock:
             self._deployed_modules.update(
@@ -286,29 +296,41 @@ class ModuleCoordinator(Resource):
         blueprint_args: MutableMapping[str, Any] | None = None,
     ) -> ModuleCoordinator:
         logger.info("Building the blueprint")
-        global_config.update(**dict(blueprint.global_config_overrides))
-        blueprint_args = blueprint_args or {}
+        blueprint_args = dict(blueprint_args or {})
+        staged_config = global_config.model_copy(deep=True)
+        staged_config.update(**dict(blueprint.global_config_overrides))
         if "g" in blueprint_args:
-            global_config.update(**blueprint_args.pop("g"))
+            staged_config.update(**blueprint_args.pop("g"))
 
-        _run_configurators(blueprint)
-        _check_requirements(blueprint)
-        _verify_no_name_conflicts(blueprint)
+        run_preflights(blueprint, staged_config)
+        previous_config = global_config.model_dump()
+        coordinator: ModuleCoordinator | None = None
+        global_config.update(**staged_config.model_dump())
+        try:
+            _check_requirements(blueprint)
+            _verify_no_name_conflicts(blueprint)
+            _run_configurators(blueprint)
 
-        logger.info("Starting the modules")
-        coordinator = cls(g=global_config)
-        coordinator.start()
+            logger.info("Starting the modules")
+            coordinator = cls(g=global_config)
+            coordinator.start()
 
-        _deploy_all_modules(blueprint, coordinator, global_config, blueprint_args)
-        coordinator._connect_streams(blueprint)
-        _connect_module_refs(blueprint, coordinator)
+            _deploy_all_modules(blueprint, coordinator, global_config, blueprint_args)
+            coordinator._connect_streams(blueprint)
+            _connect_module_refs(blueprint, coordinator)
 
-        coordinator.build_all_modules()
-        coordinator.start_all_modules()
+            coordinator.build_all_modules()
+            coordinator.start_all_modules()
 
-        _log_blueprint_graph(blueprint, coordinator)
+            _log_blueprint_graph(blueprint, coordinator)
 
-        return coordinator
+            return coordinator
+        except BaseException:
+            if coordinator is not None:
+                with suppress(Exception):
+                    coordinator.stop()
+            global_config.update(**previous_config)
+            raise
 
     def load_blueprint(
         self,
@@ -332,22 +354,25 @@ class ModuleCoordinator(Resource):
         blueprint: Blueprint,
         blueprint_args: MutableMapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
-        # Apply config overrides.
-        self._global_config.update(**dict(blueprint.global_config_overrides))
-        blueprint_args = blueprint_args or {}
+        # Stage config overrides until preflights pass, so a failed dynamic load
+        # does not mutate a running coordinator.
+        staged_config = self._global_config.model_copy(deep=True)
+        staged_config.update(**dict(blueprint.global_config_overrides))
+        blueprint_args = dict(blueprint_args or {})
         if "g" in blueprint_args:
-            self._global_config.update(**blueprint_args.pop("g"))
+            staged_config.update(**blueprint_args.pop("g"))
 
-        # Scale worker pool.
-        n_extra = int(blueprint.global_config_overrides.get("n_workers", 0))
-        python_wm = cast("WorkerManagerPython", self._managers["python"])
-        if n_extra:
-            python_wm.add_workers(n_extra)
-        if not python_wm.workers and blueprint.active_blueprints:
-            python_wm.add_workers(1)
+        run_preflights(blueprint, staged_config, exit_on_error=False)
 
-        _run_configurators(blueprint)
-        _check_requirements(blueprint)
+        previous_config = self._global_config.model_dump()
+        self._global_config.update(**staged_config.model_dump())
+        try:
+            _check_requirements(blueprint, exit_on_error=False)
+        except BaseException:
+            self._global_config.update(**previous_config)
+            raise
+        self._global_config.update(**previous_config)
+
         _verify_no_name_conflicts(blueprint)
         _verify_no_conflicts_with_existing(blueprint, self._transport_registry)
 
@@ -358,19 +383,65 @@ class ModuleCoordinator(Resource):
                     f"{bp.module.__name__} is already deployed; cannot load the same module twice"
                 )
 
+        previous_transports = dict(self._transport_registry)
+        previous_atoms = dict(self._deployed_atoms)
+        previous_resolved_refs = dict(self._resolved_module_refs)
+        previous_class_aliases = dict(self._class_aliases)
+        previous_module_transports = {
+            module: dict(transports) for module, transports in self._module_transports.items()
+        }
         before = set(self._deployed_modules)
+        python_wm = cast("WorkerManagerPython", self._managers["python"])
+        workers_before = set(python_wm.workers)
 
-        _deploy_all_modules(blueprint, self, self._global_config, blueprint_args)
-        self._connect_streams(blueprint)
-        _connect_module_refs(blueprint, self, existing_modules=before)
+        self._global_config.update(**staged_config.model_dump())
+        try:
+            _run_configurators(blueprint, exit_on_error=False)
 
-        new_modules = [proxy for cls, proxy in self._deployed_modules.items() if cls not in before]
+            # Scale worker pool.
+            n_extra = int(blueprint.global_config_overrides.get("n_workers", 0))
+            if n_extra:
+                python_wm.add_workers(n_extra)
+            if not python_wm.workers and blueprint.active_blueprints:
+                python_wm.add_workers(1)
 
-        if new_modules:
-            safe_thread_map(new_modules, lambda m: m.build())
-            safe_thread_map(new_modules, lambda m: m.start())
+            _deploy_all_modules(blueprint, self, self._global_config, blueprint_args)
+            self._connect_streams(blueprint)
+            _connect_module_refs(blueprint, self, existing_modules=before)
 
-        self._send_on_system_modules()
+            new_modules = [
+                proxy for cls, proxy in self._deployed_modules.items() if cls not in before
+            ]
+
+            if new_modules:
+                safe_thread_map(new_modules, lambda m: m.build())
+                safe_thread_map(new_modules, lambda m: m.start())
+
+            self._send_on_system_modules()
+        except BaseException:
+            for module_class in reversed(
+                [bp.module for bp in blueprint.active_blueprints if bp.module not in before]
+            ):
+                if module_class in self._deployed_modules:
+                    with suppress(Exception):
+                        self._unload_module(module_class)
+
+            self._transport_registry = previous_transports
+            self._deployed_atoms = previous_atoms
+            self._resolved_module_refs = previous_resolved_refs
+            self._class_aliases = previous_class_aliases
+            self._module_transports = previous_module_transports
+
+            for worker in list(python_wm._workers):
+                if worker not in workers_before and worker.module_count == 0:
+                    with suppress(Exception):
+                        worker.shutdown()
+                    with suppress(ValueError):
+                        python_wm._workers.remove(worker)
+                    python_wm._n_workers = max(0, python_wm._n_workers - 1)
+
+            self._global_config.update(**previous_config)
+            raise
 
     def load_module(
         self,
@@ -644,7 +715,7 @@ def _verify_no_conflicts_with_existing(
                         )
 
 
-def _run_configurators(blueprint: Blueprint) -> None:
+def _run_configurators(blueprint: Blueprint, *, exit_on_error: bool = True) -> None:
     from dimos.protocol.service.system_configurator.base import configure_system
     from dimos.protocol.service.system_configurator.lcm_config import lcm_configurators
 
@@ -658,10 +729,14 @@ def _run_configurators(blueprint: Blueprint) -> None:
             f"Required system configuration was declined: {', '.join(labels)}",
             file=sys.stderr,
         )
+        if not exit_on_error:
+            raise ConfiguratorError(
+                f"Required system configuration was declined: {', '.join(labels)}"
+            ) from None
         sys.exit(1)
 
 
-def _check_requirements(blueprint: Blueprint) -> None:
+def _check_requirements(blueprint: Blueprint, *, exit_on_error: bool = True) -> None:
     errors = []
     red = "\033[31m"
     reset = "\033[0m"
@@ -674,6 +749,8 @@ def _check_requirements(blueprint: Blueprint) -> None:
     if errors:
         for error in errors:
             print(f"{red}Error: {error}{reset}", file=sys.stderr)
+        if not exit_on_error:
+            raise RequirementError(errors)
         sys.exit(1)
 
 

@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from types import MappingProxyType
-from typing import Protocol
+from typing import Any, Protocol
+import uuid
 
 import pytest
 
@@ -27,19 +29,29 @@ from dimos.core.coordination.blueprints import (
 )
 from dimos.core.coordination.coordinator_rpc import CoordinatorRPC
 from dimos.core.coordination.module_coordinator import (
+    ConfiguratorError,
     ModuleCoordinator,
+    RequirementError,
     _all_name_types,
     _check_requirements,
     _verify_no_conflicts_with_existing,
     _verify_no_name_conflicts,
 )
+from dimos.core.coordination.preflight import (
+    PreflightError,
+    PreflightResult,
+    owned_preflight,
+    run_preflights,
+)
 from dimos.core.coordination.worker_manager_python import WorkerManagerPython
 from dimos.core.core import rpc
-from dimos.core.global_config import GlobalConfig
+from dimos.core.global_config import GlobalConfig, global_config
 from dimos.core.module import Module
 from dimos.core.stream import In, Out
 from dimos.msgs.sensor_msgs.Image import Image
+from dimos.protocol.rpc.pubsubrpc import LCMRPC
 from dimos.spec.utils import Spec
+from dimos.utils.safe_thread_map import ExceptionGroup as ThreadMapExceptionGroup
 
 # Disable Rerun for tests (prevents viewer spawn and gRPC flush errors)
 _BUILD_WITHOUT_RERUN = MappingProxyType(
@@ -92,6 +104,37 @@ class SourceModule(Module):
 
 class TargetModule(Module):
     remapped_data: In[Data1]
+
+
+class ExistingSharedModule(Module):
+    shared: Out[Data1]
+
+
+class ConflictingSharedModule(Module):
+    shared: Out[Data2]
+
+
+class DeployFailModule(Module):
+    failed_output: Out[Data1]
+
+    def __init__(self, **kwargs: Any) -> None:
+        raise RuntimeError("deploy failed")
+
+
+class SlowDeployFailModule(Module):
+    failed_output: Out[Data1]
+
+    def __init__(self, **kwargs: Any) -> None:
+        time.sleep(0.2)
+        raise RuntimeError("deploy failed")
+
+
+class BuildFailModule(Module):
+    failed_output: Out[Data1]
+
+    @rpc
+    def build(self) -> None:
+        raise RuntimeError("build failed")
 
 
 # ModuleRef / RPC tests
@@ -592,6 +635,441 @@ def test_check_requirements_failure(mocker) -> None:
         _check_requirements(bp)
 
 
+def test_run_preflights_applies_updates_before_requirements(capsys) -> None:
+    config = GlobalConfig(robot_ip=None, viewer="none")
+    seen: list[str | None] = []
+
+    def resolve_robot_ip(gc: GlobalConfig) -> PreflightResult:
+        assert gc.robot_ip is None
+        return PreflightResult.ok(
+            config_updates={"robot_ip": "192.168.0.117"},
+            notes=("resolved test robot",),
+        )
+
+    def require_robot_ip() -> str | None:
+        seen.append(config.robot_ip)
+        return None if config.robot_ip == "192.168.0.117" else "robot_ip not resolved"
+
+    bp = ModuleA.blueprint().preflights(resolve_robot_ip).requirements(require_robot_ip)
+
+    run_preflights(bp, config)
+    _check_requirements(bp)
+
+    assert config.robot_ip == "192.168.0.117"
+    assert seen == ["192.168.0.117"]
+    assert "resolved test robot" in capsys.readouterr().err
+
+
+def test_run_preflights_exits_on_errors(capsys) -> None:
+    def fail_preflight(gc: GlobalConfig) -> PreflightResult:
+        return PreflightResult.fail(f"bad robot_ip={gc.robot_ip}")
+
+    bp = ModuleA.blueprint().preflights(fail_preflight)
+
+    with pytest.raises(SystemExit):
+        run_preflights(bp, GlobalConfig(robot_ip="192.168.0.200", viewer="none"))
+
+    assert "bad robot_ip=192.168.0.200" in capsys.readouterr().err
+
+
+def test_run_preflights_keeps_config_updates_atomic_on_errors() -> None:
+    config = GlobalConfig(robot_ip=None, viewer="none")
+    seen_by_second: list[str | None] = []
+
+    def resolve_robot_ip(gc: GlobalConfig) -> PreflightResult:
+        return PreflightResult.ok(config_updates={"robot_ip": "192.168.0.117"})
+
+    def fail_after_staged_update(gc: GlobalConfig) -> PreflightResult:
+        seen_by_second.append(gc.robot_ip)
+        return PreflightResult.fail("late preflight failed")
+
+    bp = ModuleA.blueprint().preflights(resolve_robot_ip, fail_after_staged_update)
+
+    with pytest.raises(SystemExit):
+        run_preflights(bp, config)
+
+    assert seen_by_second == ["192.168.0.117"]
+    assert config.robot_ip is None
+
+
+def test_run_preflights_rejects_direct_config_mutation() -> None:
+    config = GlobalConfig(robot_ip=None, viewer="none")
+
+    def mutate_config_directly(gc: GlobalConfig) -> PreflightResult:
+        gc.robot_ip = "192.168.0.117"
+        return PreflightResult.ok()
+
+    bp = ModuleA.blueprint().preflights(mutate_config_directly)
+
+    with pytest.raises(SystemExit):
+        run_preflights(bp, config)
+
+    assert config.robot_ip is None
+
+
+def test_run_preflights_skips_owned_checks_when_owner_module_is_disabled() -> None:
+    calls: list[str] = []
+
+    def owned_check(gc: GlobalConfig) -> PreflightResult:
+        calls.append("called")
+        return PreflightResult.ok(config_updates={"robot_ip": "192.168.0.117"})
+
+    bp = (
+        ModuleA.blueprint()
+        .preflights(owned_preflight(owned_check, ModuleA))
+        .disabled_modules(ModuleA)
+    )
+    config = GlobalConfig(robot_ip=None, viewer="none")
+
+    run_preflights(bp, config)
+
+    assert calls == []
+    assert config.robot_ip is None
+
+
+def test_load_blueprint_runs_preflights_before_worker_scaling(
+    dynamic_coordinator,
+    monkeypatch,
+) -> None:
+    seen_by_worker_scaling: list[str | None] = []
+    python_wm = dynamic_coordinator._managers["python"]
+    assert isinstance(python_wm, WorkerManagerPython)
+
+    def resolve_robot_ip(gc: GlobalConfig) -> PreflightResult:
+        return PreflightResult.ok(config_updates={"robot_ip": "192.168.0.117"})
+
+    def record_add_workers(n_workers: int) -> None:
+        seen_by_worker_scaling.append(dynamic_coordinator._global_config.robot_ip)
+
+    monkeypatch.setattr(python_wm, "add_workers", record_add_workers)
+
+    dynamic_coordinator.load_blueprint(
+        autoconnect().global_config(n_workers=1).preflights(resolve_robot_ip)
+    )
+
+    assert seen_by_worker_scaling == ["192.168.0.117"]
+    assert dynamic_coordinator._global_config.robot_ip == "192.168.0.117"
+
+
+def test_load_blueprint_failing_preflight_does_not_scale_or_deploy(
+    dynamic_coordinator,
+    monkeypatch,
+) -> None:
+    add_worker_calls: list[int] = []
+    original_config = dynamic_coordinator._global_config.model_dump()
+    python_wm = dynamic_coordinator._managers["python"]
+    assert isinstance(python_wm, WorkerManagerPython)
+
+    def fail_preflight(gc: GlobalConfig) -> PreflightResult:
+        return PreflightResult.fail("preflight rejected startup")
+
+    def record_add_workers(n_workers: int) -> None:
+        add_worker_calls.append(n_workers)
+
+    monkeypatch.setattr(python_wm, "add_workers", record_add_workers)
+    blueprint_args = {"g": {"robot_ip": "192.168.0.118"}}
+
+    with pytest.raises(PreflightError):
+        dynamic_coordinator.load_blueprint(
+            ModuleA.blueprint()
+            .global_config(n_workers=1, robot_ip="192.168.0.117")
+            .preflights(fail_preflight),
+            blueprint_args,
+        )
+
+    assert add_worker_calls == []
+    assert dynamic_coordinator.get_instance(ModuleA) is None
+    assert dynamic_coordinator._global_config.model_dump() == original_config
+    assert blueprint_args == {"g": {"robot_ip": "192.168.0.118"}}
+
+
+def test_load_blueprint_failing_requirement_does_not_scale_or_deploy(
+    dynamic_coordinator,
+    monkeypatch,
+) -> None:
+    add_worker_calls: list[int] = []
+    original_config = dynamic_coordinator._global_config.model_dump()
+    python_wm = dynamic_coordinator._managers["python"]
+    assert isinstance(python_wm, WorkerManagerPython)
+
+    def resolve_robot_ip(gc: GlobalConfig) -> PreflightResult:
+        return PreflightResult.ok(config_updates={"robot_ip": "192.168.0.117"})
+
+    def reject_requirement() -> str:
+        return "requirement rejected startup"
+
+    def record_add_workers(n_workers: int) -> None:
+        add_worker_calls.append(n_workers)
+
+    monkeypatch.setattr(python_wm, "add_workers", record_add_workers)
+
+    with pytest.raises(RequirementError):
+        dynamic_coordinator.load_blueprint(
+            ModuleA.blueprint()
+            .global_config(n_workers=1)
+            .preflights(resolve_robot_ip)
+            .requirements(reject_requirement)
+        )
+
+    assert add_worker_calls == []
+    assert dynamic_coordinator.get_instance(ModuleA) is None
+    assert dynamic_coordinator._global_config.model_dump() == original_config
+
+
+def test_load_blueprint_configurator_decline_raises_without_exiting_or_mutating_config(
+    dynamic_coordinator,
+    mocker,
+) -> None:
+    original_config = dynamic_coordinator._global_config.model_dump()
+    mocker.patch(
+        "dimos.protocol.service.system_configurator.base.configure_system",
+        side_effect=SystemExit(1),
+    )
+
+    with pytest.raises(ConfiguratorError):
+        dynamic_coordinator.load_blueprint(
+            ModuleA.blueprint().global_config(robot_ip="192.168.0.117")
+        )
+
+    assert dynamic_coordinator.get_instance(ModuleA) is None
+    assert dynamic_coordinator._global_config.model_dump() == original_config
+
+
+def test_load_blueprint_duplicate_module_does_not_scale_or_change_config(
+    dynamic_coordinator,
+    monkeypatch,
+) -> None:
+    dynamic_coordinator.load_blueprint(ModuleA.blueprint())
+    add_worker_calls: list[int] = []
+    original_config = dynamic_coordinator._global_config.model_dump()
+    python_wm = dynamic_coordinator._managers["python"]
+    assert isinstance(python_wm, WorkerManagerPython)
+
+    def record_add_workers(n_workers: int) -> None:
+        add_worker_calls.append(n_workers)
+
+    monkeypatch.setattr(python_wm, "add_workers", record_add_workers)
+
+    with pytest.raises(ValueError, match="already deployed"):
+        dynamic_coordinator.load_blueprint(
+            ModuleA.blueprint().global_config(n_workers=1, robot_ip="192.168.0.117")
+        )
+
+    assert add_worker_calls == []
+    assert dynamic_coordinator._global_config.model_dump() == original_config
+
+
+def test_load_blueprint_stream_conflict_does_not_scale_or_change_config(
+    dynamic_coordinator,
+    monkeypatch,
+) -> None:
+    dynamic_coordinator.load_blueprint(ExistingSharedModule.blueprint())
+    add_worker_calls: list[int] = []
+    original_config = dynamic_coordinator._global_config.model_dump()
+    python_wm = dynamic_coordinator._managers["python"]
+    assert isinstance(python_wm, WorkerManagerPython)
+
+    def record_add_workers(n_workers: int) -> None:
+        add_worker_calls.append(n_workers)
+
+    monkeypatch.setattr(python_wm, "add_workers", record_add_workers)
+
+    with pytest.raises(ValueError, match="existing transport"):
+        dynamic_coordinator.load_blueprint(
+            ConflictingSharedModule.blueprint().global_config(
+                n_workers=1,
+                robot_ip="192.168.0.117",
+            )
+        )
+
+    assert add_worker_calls == []
+    assert dynamic_coordinator.get_instance(ConflictingSharedModule) is None
+    assert dynamic_coordinator._global_config.model_dump() == original_config
+
+
+def test_load_blueprint_deploy_failure_keeps_existing_coordinator_alive(
+    dynamic_coordinator,
+) -> None:
+    dynamic_coordinator.load_blueprint(ModuleA.blueprint())
+    original_config = dynamic_coordinator._global_config.model_dump()
+    original_transports = dict(dynamic_coordinator._transport_registry)
+
+    with pytest.raises(ThreadMapExceptionGroup):
+        dynamic_coordinator.load_blueprint(
+            DeployFailModule.blueprint().global_config(robot_ip="192.168.0.117")
+        )
+
+    assert dynamic_coordinator.get_instance(ModuleA).get_name() == "A, Module A"
+    assert dynamic_coordinator.get_instance(DeployFailModule) is None
+    assert dynamic_coordinator._transport_registry == original_transports
+    assert dynamic_coordinator._global_config.model_dump() == original_config
+
+    dynamic_coordinator.load_blueprint(ModuleC.blueprint())
+    assert dynamic_coordinator.get_instance(ModuleC) is not None
+
+
+def test_load_blueprint_deploy_failure_preserves_existing_idle_workers() -> None:
+    coordinator = ModuleCoordinator(g=GlobalConfig(n_workers=1, viewer="none"))
+    coordinator.start()
+    try:
+        python_wm = coordinator._managers["python"]
+        assert isinstance(python_wm, WorkerManagerPython)
+        original_workers = python_wm.workers
+        assert len(original_workers) == 1
+        assert original_workers[0].module_count == 0
+
+        with pytest.raises(ThreadMapExceptionGroup):
+            coordinator.load_blueprint(
+                autoconnect(
+                    ModuleA.blueprint(),
+                    SlowDeployFailModule.blueprint(),
+                )
+            )
+
+        assert python_wm.workers == original_workers
+        assert original_workers[0].pid is not None
+        assert original_workers[0].module_count == 0
+        assert coordinator.get_instance(ModuleA) is None
+        assert coordinator.get_instance(SlowDeployFailModule) is None
+        assert python_wm.health_check()
+    finally:
+        coordinator.stop()
+
+
+def test_load_blueprint_build_failure_rolls_back_dynamic_load(
+    dynamic_coordinator,
+) -> None:
+    dynamic_coordinator.load_blueprint(ModuleA.blueprint())
+    original_config = dynamic_coordinator._global_config.model_dump()
+    original_transports = dict(dynamic_coordinator._transport_registry)
+
+    with pytest.raises(ThreadMapExceptionGroup):
+        dynamic_coordinator.load_blueprint(
+            BuildFailModule.blueprint().global_config(robot_ip="192.168.0.117")
+        )
+
+    assert dynamic_coordinator.get_instance(ModuleA).get_name() == "A, Module A"
+    assert dynamic_coordinator.get_instance(BuildFailModule) is None
+    assert dynamic_coordinator._transport_registry == original_transports
+    assert dynamic_coordinator._global_config.model_dump() == original_config
+
+    dynamic_coordinator.load_blueprint(ModuleC.blueprint())
+    assert dynamic_coordinator.get_instance(ModuleC) is not None
+
+
+def test_build_failing_preflight_does_not_mutate_global_config() -> None:
+    original_config = global_config.model_dump()
+    blueprint_args: dict[str, object] = {"g": {"robot_ip": "192.168.0.118"}}
+
+    def fail_preflight(gc: GlobalConfig) -> PreflightResult:
+        assert gc.robot_ip == "192.168.0.118"
+        return PreflightResult.fail("preflight rejected build")
+
+    try:
+        with pytest.raises(SystemExit):
+            ModuleCoordinator.build(
+                ModuleA.blueprint()
+                .global_config(n_workers=1, robot_ip="192.168.0.117")
+                .preflights(fail_preflight),
+                blueprint_args,
+            )
+    finally:
+        global_config.update(**original_config)
+
+    assert global_config.model_dump() == original_config
+    assert blueprint_args == {"g": {"robot_ip": "192.168.0.118"}}
+
+
+def test_build_failing_requirement_rolls_back_global_config() -> None:
+    original_config = global_config.model_dump()
+    seen_by_requirement: list[str | None] = []
+
+    def resolve_robot_ip(gc: GlobalConfig) -> PreflightResult:
+        return PreflightResult.ok(config_updates={"robot_ip": "192.168.0.117"})
+
+    def reject_requirement() -> str:
+        seen_by_requirement.append(global_config.robot_ip)
+        return "requirement rejected build"
+
+    try:
+        with pytest.raises(SystemExit):
+            ModuleCoordinator.build(
+                ModuleA.blueprint().preflights(resolve_robot_ip).requirements(reject_requirement),
+                _BUILD_WITHOUT_RERUN.copy(),
+            )
+    finally:
+        global_config.update(**original_config)
+
+    assert seen_by_requirement == ["192.168.0.117"]
+    assert global_config.model_dump() == original_config
+
+
+def test_build_name_conflict_rolls_back_global_config() -> None:
+    original_config = global_config.model_dump()
+
+    class ConflictingOut(Module):
+        shared: Out[Data1]
+
+    class ConflictingIn(Module):
+        shared: In[Data2]
+
+    try:
+        with pytest.raises(ValueError, match="conflicting streams"):
+            ModuleCoordinator.build(
+                autoconnect(ConflictingOut.blueprint(), ConflictingIn.blueprint()).global_config(
+                    robot_ip="192.168.0.117"
+                ),
+                _BUILD_WITHOUT_RERUN.copy(),
+            )
+    finally:
+        global_config.update(**original_config)
+
+    assert global_config.model_dump() == original_config
+
+
+def test_build_configurator_decline_rolls_back_global_config(mocker) -> None:
+    original_config = global_config.model_dump()
+    start = mocker.patch.object(ModuleCoordinator, "start")
+    mocker.patch(
+        "dimos.protocol.service.system_configurator.base.configure_system",
+        side_effect=SystemExit(1),
+    )
+
+    try:
+        with pytest.raises(SystemExit):
+            ModuleCoordinator.build(
+                ModuleA.blueprint().global_config(robot_ip="192.168.0.117"),
+                _BUILD_WITHOUT_RERUN.copy(),
+            )
+    finally:
+        global_config.update(**original_config)
+
+    start.assert_not_called()
+    assert global_config.model_dump() == original_config
+
+
+def test_build_deploy_failure_stops_partial_coordinator_and_rolls_back_config(mocker) -> None:
+    original_config = global_config.model_dump()
+    mocker.patch.object(ModuleCoordinator, "start")
+    stop = mocker.patch.object(ModuleCoordinator, "stop")
+    mocker.patch(
+        "dimos.core.coordination.module_coordinator._deploy_all_modules",
+        side_effect=RuntimeError("deploy failed"),
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="deploy failed"):
+            ModuleCoordinator.build(
+                ModuleA.blueprint().global_config(robot_ip="192.168.0.117"),
+                _BUILD_WITHOUT_RERUN.copy(),
+            )
+    finally:
+        global_config.update(**original_config)
+
+    stop.assert_called_once()
+    assert global_config.model_dump() == original_config
+
+
 def test_restart_module_basic(dynamic_coordinator) -> None:
     """restart_module replaces the deployed proxy with a fresh one."""
     dynamic_coordinator.load_module(ModuleA)
@@ -776,7 +1254,14 @@ def test_restart_preserves_remapped_streams(dynamic_coordinator) -> None:
     assert source_after.color_image.transport.topic == target.remapped_data.transport.topic
 
 
-def test_start_rpc_service_responds_to_ping(dynamic_coordinator) -> None:
+def test_start_rpc_service_responds_to_ping(dynamic_coordinator, monkeypatch) -> None:
+    port = 20000 + (uuid.uuid4().int % 20000)
+    url = f"udpm://239.255.76.67:{port}?ttl=0"
+    monkeypatch.setattr(
+        "dimos.core.coordination.coordinator_rpc.LCMRPC",
+        lambda **kwargs: LCMRPC(url=url, **kwargs),
+    )
+
     dynamic_coordinator.start_rpc_service()
     client = CoordinatorRPC.connect(timeout=2.0)
     try:

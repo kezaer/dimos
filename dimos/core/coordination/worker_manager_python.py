@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 from dimos.core.coordination.python_worker import PythonWorker
@@ -22,7 +23,7 @@ from dimos.core.global_config import GlobalConfig
 from dimos.core.module import ModuleBase, ModuleSpec
 from dimos.core.rpc_client import ModuleProxyProtocol, RPCClient
 from dimos.utils.logging_config import setup_logger
-from dimos.utils.safe_thread_map import safe_thread_map
+from dimos.utils.safe_thread_map import ExceptionGroup, safe_thread_map
 
 if TYPE_CHECKING:
     from dimos.core.resource_monitor.monitor import StatsMonitor
@@ -113,7 +114,7 @@ class WorkerManagerPython:
         actor = worker.deploy_module(module_class, global_config, kwargs=kwargs)
         return RPCClient(actor, module_class)
 
-    def undeploy(self, proxy: ModuleProxyProtocol) -> None:
+    def undeploy(self, proxy: ModuleProxyProtocol, *, shutdown_empty_worker: bool = True) -> None:
         """Undeploy a module and shut down its worker if it is now empty."""
         actor = getattr(proxy, "actor_instance", None)
         if actor is None:
@@ -128,9 +129,14 @@ class WorkerManagerPython:
         if target is None:
             raise ValueError(f"No worker holds module_id={module_id}")
 
-        target.undeploy_module(module_id)
+        try:
+            target.undeploy_module(module_id)
+        finally:
+            stop_rpc_client = getattr(proxy, "stop_rpc_client", None)
+            if callable(stop_rpc_client):
+                stop_rpc_client()
 
-        if not target._modules:
+        if shutdown_empty_worker and not target._modules:
             target.shutdown()
             self._workers.remove(target)
             self._n_workers = max(0, self._n_workers - 1)
@@ -147,6 +153,9 @@ class WorkerManagerPython:
 
         if not self._started:
             self.start()
+
+        original_workers = set(self._workers)
+        original_dedicated = {worker: worker.dedicated for worker in self._workers}
 
         self._ensure_capacity_for_dedicated(specs)
 
@@ -172,11 +181,32 @@ class WorkerManagerPython:
                 worker.deploy_module(module_class, global_config, kwargs), module_class
             )
 
-        try:
-            return safe_thread_map(assignments, _deploy)
-        except:
-            self.stop()
-            raise
+        def _on_errors(
+            _outcomes: list[
+                tuple[tuple[PythonWorker, ModuleSpec], ModuleProxyProtocol | Exception]
+            ],
+            successes: list[ModuleProxyProtocol],
+            errors: list[Exception],
+        ) -> list[ModuleProxyProtocol]:
+            for proxy in reversed(successes):
+                with suppress(Exception):
+                    self.undeploy(proxy, shutdown_empty_worker=False)
+
+            for worker, was_dedicated in original_dedicated.items():
+                if worker in self._workers:
+                    worker.dedicated = was_dedicated
+
+            for worker in list(self._workers):
+                if worker not in original_workers and worker.module_count == 0:
+                    with suppress(Exception):
+                        worker.shutdown()
+                    with suppress(ValueError):
+                        self._workers.remove(worker)
+                    self._n_workers = max(0, self._n_workers - 1)
+
+            raise ExceptionGroup("safe_thread_map failed", errors)
+
+        return safe_thread_map(assignments, _deploy, on_errors=_on_errors)
 
     def health_check(self) -> bool:
         if len(self._workers) == 0:

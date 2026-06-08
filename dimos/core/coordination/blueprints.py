@@ -23,15 +23,16 @@ from typing import TYPE_CHECKING, Any, Literal, Union, get_args, get_origin, get
 
 from pydantic import create_model
 
-if TYPE_CHECKING:
-    from dimos.protocol.service.system_configurator.base import SystemConfigurator
-
+from dimos.core.coordination.preflight import OwnedPreflight, PreflightCheck
 from dimos.core.global_config import GlobalConfig
 from dimos.core.module import ModuleBase, is_module_type
 from dimos.core.stream import In, Out
 from dimos.core.transport import PubSubTransport
 from dimos.spec.utils import Spec, is_spec
 from dimos.utils.logging_config import setup_logger
+
+if TYPE_CHECKING:
+    from dimos.protocol.service.system_configurator.base import SystemConfigurator
 
 if sys.version_info >= (3, 11):
     from typing import Self
@@ -156,6 +157,7 @@ class Blueprint:
     remapping_map: Mapping[tuple[type[ModuleBase], str], str | type[ModuleBase] | type[Spec]] = (
         field(default_factory=lambda: MappingProxyType({}))
     )
+    preflight_checks: "tuple[PreflightCheck, ...]" = field(default_factory=tuple)
     requirement_checks: tuple[Callable[[], str | None], ...] = field(default_factory=tuple)
     configurator_checks: "tuple[SystemConfigurator, ...]" = field(default_factory=tuple)
 
@@ -208,6 +210,9 @@ class Blueprint:
     def requirements(self, *checks: Callable[[], str | None]) -> "Blueprint":
         return replace(self, requirement_checks=self.requirement_checks + tuple(checks))
 
+    def preflights(self, *checks: "PreflightCheck") -> "Blueprint":
+        return replace(self, preflight_checks=self.preflight_checks + tuple(checks))
+
     def configurators(self, *checks: "SystemConfigurator") -> "Blueprint":
         return replace(self, configurator_checks=self.configurator_checks + tuple(checks))
 
@@ -230,6 +235,9 @@ def autoconnect(*blueprints: Blueprint) -> Blueprint:
     all_remappings = dict(  # type: ignore[var-annotated]
         reduce(operator.iadd, [list(x.remapping_map.items()) for x in blueprints], [])
     )
+    all_preflight_checks = _eliminate_duplicate_checks(
+        [check for bs in blueprints for check in bs.preflight_checks]
+    )
     all_requirement_checks = tuple(check for bs in blueprints for check in bs.requirement_checks)
     all_configurator_checks = tuple(check for bs in blueprints for check in bs.configurator_checks)
 
@@ -241,6 +249,7 @@ def autoconnect(*blueprints: Blueprint) -> Blueprint:
         transport_map=MappingProxyType(all_transports),
         global_config_overrides=MappingProxyType(all_config_overrides),
         remapping_map=MappingProxyType(all_remappings),
+        preflight_checks=all_preflight_checks,
         requirement_checks=all_requirement_checks,
         configurator_checks=all_configurator_checks,
     )
@@ -255,3 +264,21 @@ def _eliminate_duplicates(blueprints: list[BlueprintAtom]) -> list[BlueprintAtom
             seen.add(bp.module)
             unique_blueprints.append(bp)
     return list(reversed(unique_blueprints))
+
+
+def _eliminate_duplicate_checks(checks: list[PreflightCheck]) -> tuple[PreflightCheck, ...]:
+    seen: set[object] = set()
+    unique_checks: list[PreflightCheck] = []
+    for check in checks:
+        marker = _preflight_dedupe_key(check)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique_checks.append(check)
+    return tuple(unique_checks)
+
+
+def _preflight_dedupe_key(check: PreflightCheck) -> object:
+    if isinstance(check, OwnedPreflight):
+        return (check.check, check.owner_modules)
+    return check

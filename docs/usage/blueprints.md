@@ -230,6 +230,36 @@ The config is normally taken from .env or from environment variables. But you ca
 blueprint = ModuleA.blueprint().global_config(n_workers=8)
 ```
 
+## Preflights, requirements, and configurators
+
+Blueprints can run startup checks before modules are deployed:
+
+- `preflights()` validate or safely repair runtime configuration, such as resolving a robot IP from discovery.
+- `requirements()` are pure fatal gates that return an error string when startup should stop.
+- `configurators()` apply host/system configuration through `SystemConfigurator`, such as LCM buffer setup.
+
+Preflights receive the resolved `GlobalConfig` after `.env`, environment variables, blueprint overrides, config files, and CLI overrides have been applied. A preflight returns a `PreflightResult` with optional config updates, notes, warnings, or errors. The coordinator stages updates as preflights run, aborts without mutating the real config if any preflight reports an error, and applies all successful updates before module configs are instantiated. Module defaults that read `self.config.g` see the repaired values.
+
+```python
+from dimos.core.coordination.preflight import PreflightResult
+from dimos.core.global_config import GlobalConfig
+
+def resolve_robot_ip(config: GlobalConfig) -> PreflightResult:
+    if config.robot_ip is not None:
+        return PreflightResult.ok()
+    discovered_ip = discover_one_robot_ip()
+    if discovered_ip is None:
+        return PreflightResult.fail("No robot found. Pass --robot-ip <ip>.")
+    return PreflightResult.ok(
+        config_updates={"robot_ip": discovered_ip},
+        notes=(f"using discovered robot_ip={discovered_ip}",),
+    )
+
+blueprint = ModuleA.blueprint().preflights(resolve_robot_ip)
+```
+
+Keep preflights conservative. They should not send robot motion commands or start hardware streams. They should only repair configuration when the evidence is unambiguous, and they should skip intentional virtual modes such as replay, simulation, and mocks.
+
 ## Providing blueprint configuration to users
 
 `Blueprint.config()` can be used to get a `pydantic.BaseModel` that can be used to
