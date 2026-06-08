@@ -4,8 +4,6 @@ window.onerror = (msg, url, line, col, error) => {
     document.getElementById('status').textContent = `Error: ${msg}`;
 };
 
-import { geometry_msgs, std_msgs, sensor_msgs } from "https://esm.sh/jsr/@dimos/msgs@0.1.4";
-
 // WebSocket and VR state
 let ws = null;
 let xrSession = null;
@@ -241,19 +239,15 @@ function processTracking(frame) {
         const rot = pose.transform.orientation;
 
         const nowMs = Date.now();
-        const poseStamped = new geometry_msgs.PoseStamped({
-            header: new std_msgs.Header({
-                stamp: new std_msgs.Time({ sec: Math.floor(nowMs / 1000), nsec: (nowMs % 1000) * 1_000_000 }),
-                frame_id: handedness
-            }),
-            pose: new geometry_msgs.Pose({
-                position: new geometry_msgs.Point({ x: pos.x, y: pos.y, z: pos.z }),
-                orientation: new geometry_msgs.Quaternion({ x: rot.x, y: rot.y, z: rot.z, w: rot.w })
-            })
-        });
 
         if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(poseStamped.encode());
+            ws.send(JSON.stringify({
+                type: "pose",
+                ts: nowMs / 1000,
+                frame_id: handedness,
+                position: { x: pos.x, y: pos.y, z: pos.z },
+                orientation: { x: rot.x, y: rot.y, z: rot.z, w: rot.w }
+            }));
         }
 
         // Send Joy message with all buttons and axes
@@ -282,19 +276,14 @@ function processTracking(frame) {
                 buttons.push(gamepad.buttons[i]?.pressed ? 1 : 0);
             }
 
-            const joyMsg = new sensor_msgs.Joy({
-                header: new std_msgs.Header({
-                    stamp: new std_msgs.Time({ sec: Math.floor(nowMs / 1000), nsec: (nowMs % 1000) * 1_000_000 }),
-                    frame_id: handedness
-                }),
-                axes_length: axes.length,
-                buttons_length: buttons.length,
-                axes: axes,
-                buttons: buttons
-            });
-
             if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(joyMsg.encode());
+                ws.send(JSON.stringify({
+                    type: "joy",
+                    ts: nowMs / 1000,
+                    frame_id: handedness,
+                    axes: axes,
+                    buttons: buttons
+                }));
             }
         }
     }

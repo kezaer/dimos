@@ -14,9 +14,13 @@
 # limitations under the License.
 
 from dimos.core.coordination.blueprints import autoconnect
+from dimos.core.transport import JpegLcmTransport, LCMTransport
+from dimos.msgs.geometry_msgs.Twist import Twist
+from dimos.msgs.sensor_msgs.Image import Image
 from dimos.robot.unitree.go2.blueprints.basic.unitree_go2_basic import unitree_go2_basic
 from dimos.robot.unitree.go2.blueprints.basic.unitree_go2_fleet import unitree_go2_fleet
 from dimos.teleop.phone.phone_extensions import SimplePhoneTeleop
+from dimos.teleop.phone.startup import phone_teleop_lan_ui_preflight
 
 # Simple phone teleop (mobile base axis filtering + cmd_vel output)
 teleop_phone = autoconnect(
@@ -24,16 +28,28 @@ teleop_phone = autoconnect(
 )
 
 # Phone teleop wired to Unitree Go2
-teleop_phone_go2 = autoconnect(
-    SimplePhoneTeleop.blueprint(),
-    unitree_go2_basic,
+teleop_phone_go2 = (
+    autoconnect(
+        SimplePhoneTeleop.blueprint(),
+        unitree_go2_basic,
+    )
+    .preflights(phone_teleop_lan_ui_preflight)
+    .transports(
+        {
+            # Browser/Rerun keyboard controls publish tele_cmd_vel; Go2Connection
+            # listens on cmd_vel in this direct teleop stack.
+            ("tele_cmd_vel", Twist): LCMTransport("/cmd_vel", Twist),
+            # RerunBridge listens to LCM pubsubs, so expose the camera over JPEG-LCM.
+            ("color_image", Image): JpegLcmTransport("/color_image", Image),
+        }
+    )
 )
 
 # Phone teleop wired to Go2 fleet — twist commands sent to all robots
 teleop_phone_go2_fleet = autoconnect(
     SimplePhoneTeleop.blueprint(),
     unitree_go2_fleet,
-)
+).preflights(phone_teleop_lan_ui_preflight)
 
 
 __all__ = ["teleop_phone", "teleop_phone_go2", "teleop_phone_go2_fleet"]

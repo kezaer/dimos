@@ -29,11 +29,15 @@ import asyncio
 
 # For audio processing
 import io
+import ipaddress
 from pathlib import Path
 from queue import Empty, Queue
+import socket
 import subprocess
+import tempfile
 from threading import Lock
 import time
+from typing import Any
 
 import cv2
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -354,35 +358,44 @@ class FastAPIServer(EdgeIO):
             self.app.get(f"/video_feed/{key}")(self.create_video_feed_route(key))  # type: ignore[no-untyped-call]
 
     @staticmethod
-    def _ensure_certs(certs_dir: Path) -> tuple[str, str]:
+    def _ensure_certs(certs_dir: Path, hosts: set[str] | None = None) -> tuple[str, str]:
         """Return (cert_path, key_path), generating self-signed certs if needed.
         HTTPS is required by browsers for sensor APIs (DeviceOrientation)"""
         cert_path = certs_dir / "cert.pem"
         key_path = certs_dir / "key.pem"
+        hosts = hosts or {"localhost", "127.0.0.1", "::1"}
 
-        if cert_path.exists() and key_path.exists():
+        if cert_path.exists() and key_path.exists() and _cert_covers_hosts(cert_path, hosts):
             return str(cert_path), str(key_path)
 
         certs_dir.mkdir(parents=True, exist_ok=True)
-        result = subprocess.run(
-            [
-                "openssl",
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-keyout",
-                str(key_path),
-                "-out",
-                str(cert_path),
-                "-days",
-                "365",
-                "-nodes",
-                "-subj",
-                "/CN=localhost",
-            ],
-            capture_output=True,
-        )
+        openssl_config = _openssl_san_config(hosts)
+        with tempfile.NamedTemporaryFile("w", suffix=".cnf") as config_file:
+            config_file.write(openssl_config)
+            config_file.flush()
+            result = subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-keyout",
+                    str(key_path),
+                    "-out",
+                    str(cert_path),
+                    "-days",
+                    "365",
+                    "-nodes",
+                    "-subj",
+                    "/CN=localhost",
+                    "-config",
+                    config_file.name,
+                    "-extensions",
+                    "v3_req",
+                ],
+                capture_output=True,
+            )
         if result.returncode != 0:
             raise RuntimeError(f"Failed to generate certificates: {result.stderr.decode()}")
         return str(cert_path), str(key_path)
@@ -394,7 +407,10 @@ class FastAPIServer(EdgeIO):
         if ssl:
             if ssl_certs_dir is None:
                 raise ValueError("ssl_certs_dir is required when ssl=True")
-            ssl_certfile, ssl_keyfile = self._ensure_certs(Path(ssl_certs_dir))
+            ssl_certfile, ssl_keyfile = self._ensure_certs(
+                Path(ssl_certs_dir),
+                _certificate_hosts(self.host),
+            )
 
         config = uvicorn.Config(
             self.app,
@@ -410,6 +426,100 @@ class FastAPIServer(EdgeIO):
     def shutdown(self) -> None:
         if self._server is not None:
             self._server.should_exit = True
+
+
+def _certificate_hosts(bind_host: str) -> set[str]:
+    hosts = {"localhost", "127.0.0.1", "::1"}
+    normalized = bind_host.strip("[]").split("%", 1)[0]
+    if normalized in {"0.0.0.0", "::", ""}:
+        hosts.update(_local_interface_ips())
+        return hosts
+    hosts.add(normalized)
+    return hosts
+
+
+def _local_interface_ips() -> set[str]:
+    ips: set[str] = set()
+    try:
+        import psutil
+
+        for addrs in psutil.net_if_addrs().values():
+            for addr in addrs:
+                if addr.family in (socket.AF_INET, socket.AF_INET6):
+                    host = addr.address.split("%", 1)[0]
+                    if _cert_ip_allowed(host):
+                        ips.add(host)
+    except Exception:
+        pass
+
+    try:
+        for result in socket.getaddrinfo(socket.gethostname(), None):
+            host = str(result[4][0]).split("%", 1)[0]
+            if _cert_ip_allowed(host):
+                ips.add(host)
+    except OSError:
+        pass
+
+    return ips
+
+
+def _cert_ip_allowed(host: str) -> bool:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return not address.is_unspecified
+
+
+def _cert_covers_hosts(cert_path: Path, hosts: set[str]) -> bool:
+    try:
+        cert = ssl_decode_cert(str(cert_path))
+    except Exception:
+        return False
+    san_hosts = {
+        value for key, value in cert.get("subjectAltName", ()) if key in {"DNS", "IP Address"}
+    }
+    return all(host in san_hosts for host in hosts)
+
+
+def ssl_decode_cert(cert_path: str) -> dict[str, Any]:
+    import ssl
+
+    return ssl._ssl._test_decode_cert(cert_path)  # type: ignore[attr-defined,no-any-return]
+
+
+def _openssl_san_config(hosts: set[str]) -> str:
+    dns_hosts: list[str] = []
+    ip_hosts: list[str] = []
+    for host in sorted(hosts):
+        try:
+            ipaddress.ip_address(host)
+            ip_hosts.append(host)
+        except ValueError:
+            dns_hosts.append(host)
+
+    alt_lines: list[str] = []
+    alt_lines.extend(f"DNS.{index} = {host}" for index, host in enumerate(dns_hosts, 1))
+    alt_lines.extend(f"IP.{index} = {host}" for index, host in enumerate(ip_hosts, 1))
+
+    return "\n".join(
+        [
+            "[req]",
+            "distinguished_name = req_distinguished_name",
+            "x509_extensions = v3_req",
+            "prompt = no",
+            "",
+            "[req_distinguished_name]",
+            "CN = localhost",
+            "",
+            "[v3_req]",
+            "subjectAltName = @alt_names",
+            "",
+            "[alt_names]",
+            *alt_lines,
+            "",
+        ]
+    )
 
 
 if __name__ == "__main__":

@@ -47,7 +47,7 @@ class QuestControllerState:
     """
 
     EXPECTED_AXES: ClassVar[int] = 4
-    EXPECTED_BUTTONS: ClassVar[int] = 7
+    BUTTON_COUNT: ClassVar[int] = 7
 
     is_left: bool = True
     # Analog values (0.0-1.0)
@@ -66,17 +66,17 @@ class QuestControllerState:
     def from_joy(cls, joy: Joy, is_left: bool = True) -> "QuestControllerState":
         """Create QuestControllerState from Joy message.
         Expected axes: [thumbstick_x, thumbstick_y, trigger_analog, grip_analog]
-        Expected buttons: [trigger, grip, touchpad, thumbstick, X/A, Y/B, menu]
+        Optional buttons: [trigger, grip, touchpad, thumbstick, X/A, Y/B, menu].
+        Missing buttons are treated as unpressed.
         Raises:
-            ValueError: If Joy message doesn't have expected Quest controller format.
+            ValueError: If Joy message doesn't have the required axes.
         """
         buttons = joy.buttons or []
         axes = joy.axes or []
 
-        if len(buttons) < cls.EXPECTED_BUTTONS:
-            raise ValueError(f"Expected {cls.EXPECTED_BUTTONS} buttons, got {len(buttons)}")
         if len(axes) < cls.EXPECTED_AXES:
             raise ValueError(f"Expected {cls.EXPECTED_AXES} axes, got {len(axes)}")
+        buttons = [*buttons, *([0] * max(0, cls.BUTTON_COUNT - len(buttons)))]
 
         return cls(
             is_left=is_left,
