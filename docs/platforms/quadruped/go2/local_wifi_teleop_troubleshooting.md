@@ -151,6 +151,37 @@ Or run the no-motion doctor:
 dimos go2tool doctor --robot-ip "$ROBOT_IP" --check-image
 ```
 
+## Connectivity Benchmark Evidence
+
+A local no-motion hardware benchmark compared upstream `main` with the stacked Go2 local Wi-Fi teleop changes on 2026-06-08. It tested whether DimOS could reach a usable teleop state after a Wi-Fi/IP change, not whether motion control latency or long-run stability improved.
+
+Tested revisions:
+
+| Worktree | Revision | Role |
+|----------|----------|------|
+| `main` | `afbb5d2867` | upstream baseline |
+| `feat/go2-teleop-lan-setup` | `018f6c6e4a` | stacked Go2 LAN teleop changes |
+
+The benchmark sent no movement commands. It started `teleop-phone-go2`, checked listeners on `7779`, `8444`, `9878`, `9877`, and `3030`, probed the dashboard, command center, and phone teleop endpoints, and only then checked for one decoded `/color_image` frame. `dimos go2tool doctor` was intentionally not part of the success score.
+
+The operator had a stale remembered robot IP, `192.168.12.1`, while the reachable Go2 was on the local Wi-Fi network at `192.168.0.114`. The signal probe to the stale IP timed out in `2.003s`.
+
+| Trial | Result | Duration | Evidence |
+|-------|--------|---------:|----------|
+| `main-no-ip` | failed | 11.644s | upstream baseline exited because no robot IP was configured |
+| `stack-no-ip` | passed | 31.264s | startup selected the only discovered Go2, all expected ports opened at about 13.47s, dashboard/command-center/phone endpoints returned HTTP 200, and `/color_image` produced a `1280x720` frame |
+| `main-explicit-ip` | failed | 92.435s | upstream baseline waited on the stale explicit IP and never reached the required ports |
+| `stack-explicit-ip` | failed fast | 12.237s | startup rejected the stale explicit IP and reported the discovered reachable Go2 address |
+
+The practical improvement is that a normal single-Go2 local Wi-Fi setup can recover from "I do not know the current robot IP" by selecting the only reachable Go2 before workers deploy. A stale explicit IP fails quickly with an actionable message instead of waiting through a lower-level WebRTC timeout. If several Go2s are visible, DimOS still fails closed and asks for an explicit `--robot-ip`; it does not guess which physical robot should receive control.
+
+Limitations:
+
+- This was a single hardware benchmark run, not a statistical latency study.
+- It verified startup readiness, browser endpoint availability, and image receipt; it did not send motion commands.
+- The explicit-IP comparison used a stale IP, so it proves fail-fast stale-IP behavior rather than healthy-IP performance.
+- The successful run needed SIGTERM cleanup escalation to SIGKILL after startup verification. That did not affect the connectivity result, but it is separate shutdown behavior worth tracking if it repeats.
+
 ## Dashboard
 
 Open the dashboard at:
